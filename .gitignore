@@ -1,3 +1,6 @@
+# pnpm install
+pnpm-lock.yaml
+
 # Dependencies
 node_modules/
 package-lock.json

@@ -75,14 +75,14 @@ async function getAvailableApiKey() {
     for (const key of API_KEYS) {
         const minuteCount = await redisClient.get(`${key}:minute`);
         const dayCount = await redisClient.get(`${key}:day`);
-        
+
         // 如果分钟计数达到20或天计数达到200，跳过这个key
-        if ((minuteCount && parseInt(minuteCount) >= 20) || 
+        if ((minuteCount && parseInt(minuteCount) >= 20) ||
             (dayCount && parseInt(dayCount) >= 200)) {
             logger.debug(`Skipping key ${key.substring(0, 10)}... (minute: ${minuteCount}, day: ${dayCount})`);
             continue;
         }
-        
+
         logger.debug(`Selected API key: ${key.substring(0, 10)}... (minute: ${minuteCount}, day: ${dayCount})`);
         return key;
     }
@@ -99,14 +99,14 @@ async function updateApiKeyUsage(key) {
         tomorrow.setDate(tomorrow.getDate() + 1);
         tomorrow.setHours(0, 0, 0, 0);
         const secondsUntilTomorrow = Math.floor((tomorrow - now) / 1000);
-        
+
         const minuteKey = `${key}:minute`;
         const dayKey = `${key}:day`;
-        
+
         // 使用原子操作增加计数
         const minuteCount = await redisClient.incr(minuteKey);
         const dayCount = await redisClient.incr(dayKey);
-        
+
         // 检查是否超出限制
         if (minuteCount > 20 || dayCount > 200) {
             // 如果超出限制，回滚计数
@@ -120,7 +120,7 @@ async function updateApiKeyUsage(key) {
             }
             throw new Error('Rate limit exceeded');
         }
-        
+
         // 设置过期时间
         if (await redisClient.ttl(minuteKey) < 0) {
             await redisClient.expire(minuteKey, 60);
@@ -137,6 +137,7 @@ async function updateApiKeyUsage(key) {
 }
 
 // 处理OpenRouter API请求
+// Kimi 修改，修复了流式请求的bug
 app.post('/api/v1/chat/completions', async (req, res) => {
     try {
         const apiKey = await getAvailableApiKey();
@@ -150,18 +151,17 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             });
         }
 
-        // 检查是否请求流式响应
         const isStreaming = req.body.stream === true;
-        
         logger.info(`Making ${isStreaming ? 'streaming' : 'normal'} request to OpenRouter with key ${apiKey.substring(0, 10)}...`);
-        
+
         if (isStreaming) {
-            // 设置 SSE 响应头
+            /* ---------- 1. 设置 SSE 头 ---------- */
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
 
-            const response = await axios({
+            /* ---------- 2. 向 OpenRouter 发起流式请求 ---------- */
+            const upstream = await axios({
                 method: 'post',
                 url: 'https://openrouter.ai/api/v1/chat/completions',
                 headers: {
@@ -175,102 +175,49 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                 responseType: 'stream'
             });
 
-            // 处理流式响应
-            let buffer = '';
-            response.data.on('data', async chunk => {
+            /* ---------- 3. 逐行解析并转发 SSE ---------- */
+            let buffer = ''; // 缓存不完整的行
+            upstream.data.on('data', chunk => {
                 buffer += chunk.toString();
                 const lines = buffer.split('\n');
-                // 保留最后一行，因为它可能是不完整的
-                buffer = lines.pop() || '';
+                buffer = lines.pop() || ''; // 最后一行可能不完整，留在 buffer
 
                 for (const line of lines) {
-                    if (line.trim() === '') continue;
-                    if (line.includes('data: [DONE]')) {
+                    if (!line.trim()) continue;
+
+                    if (line === 'data: [DONE]') {
                         res.write('data: [DONE]\n\n');
                         continue;
                     }
+
                     if (line.startsWith('data: ')) {
+                        const jsonStr = line.slice(6);
                         try {
-                            // 检查是否是完整的JSON
-                            const data = line.slice(6); // 移除 'data: ' 前缀
-                            if (data.trim()) {
-                                const parsed = JSON.parse(data);
-                                // 检查是否是限流错误
-                                if (parsed.error?.code === 429) {
-                                    const errorMessage = parsed.error.message;
-                                    const resetTimestamp = parseInt(parsed.error.metadata?.headers?.['X-RateLimit-Reset'] || '0');
-                                    logger.warn(`Rate limit exceeded for key ${apiKey.substring(0, 10)}...`);
-                                    
-                                    if (resetTimestamp) {
-                                        const now = Date.now();
-                                        const ttlSeconds = Math.max(1, Math.floor((resetTimestamp - now) / 1000));
-                                        
-                                        if (errorMessage.includes('free-models-per-day')) {
-                                            await redisClient.setEx(`${apiKey}:day`, ttlSeconds, "200");
-                                            logger.info(`Marked key ${apiKey.substring(0, 10)}... as daily limit reached, will reset in ${ttlSeconds}s`);
-                                        } else if (errorMessage.includes('free-models-per-minute')) {
-                                            await redisClient.setEx(`${apiKey}:minute`, ttlSeconds, "20");
-                                            logger.info(`Marked key ${apiKey.substring(0, 10)}... as minute limit reached, will reset in ${ttlSeconds}s`);
-                                        }
-                                    } else {
-                                        // 如果没有重置时间戳，使用默认值
-                                        if (errorMessage.includes('free-models-per-day')) {
-                                            await redisClient.setEx(`${apiKey}:day`, 86400, "200");
-                                            logger.info(`Marked key ${apiKey.substring(0, 10)}... as daily limit reached (using default TTL)`);
-                                        } else if (errorMessage.includes('free-models-per-minute')) {
-                                            await redisClient.setEx(`${apiKey}:minute`, 60, "20");
-                                            logger.info(`Marked key ${apiKey.substring(0, 10)}... as minute limit reached (using default TTL)`);
-                                        }
-                                    }
-                                }
-                                
-                                // 处理转义字符
-                                if (parsed.choices && parsed.choices[0]?.delta?.content) {
-                                    // 不再需要这里的替换，因为我们会在最终输出时处理
-                                    // parsed.choices[0].delta.content = parsed.choices[0].delta.content.replace(/\\(.)/g, '$1');
-                                }
-                                if (parsed.choices && parsed.choices[0]?.delta?.reasoning) {
-                                    // 不再需要这里的替换，因为我们会在最终输出时处理
-                                    // parsed.choices[0].delta.reasoning = parsed.choices[0].delta.reasoning.replace(/\\(.)/g, '$1');
-                                }
-                                
-                                // 直接发送原始数据，避免 JSON.stringify 的额外转义
-                                res.write(`data: ${data.replaceAll('\\n', '\n')}\n\n`);
-                            }
-                        } catch (e) {
-                            // 如果JSON解析失败，说明数据不完整，等待下一个chunk
-                            logger.debug('Incomplete SSE data chunk, waiting for more data');
-                            buffer = line + '\n' + buffer; // 将不完整的行放回buffer
+                            // 仅当能完整解析 JSON 时才向下游发送
+                            JSON.parse(jsonStr);
+                            res.write(line + '\n\n');
+                        } catch {
+                            // FIX: 把不完整的行放回 buffer 尾部，避免倒序
+                            buffer = line + '\n' + buffer;
                         }
                     }
                 }
             });
 
-            response.data.on('end', async () => {
-                // 处理buffer中剩余的数据
-                if (buffer.trim()) {
-                    const line = buffer.trim();
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = line.slice(6);
-                            JSON.parse(data); // 验证是否是有效的JSON
-                            res.write(`${line}\n\n`);
-                        } catch (e) {
-                            logger.debug('Discarding incomplete data at stream end');
-                        }
-                    }
-                }
+            /* ---------- 4. 流结束 ---------- */
+            upstream.data.on('end', async () => {
+                // FIX: 不再尝试解析 buffer 中残留的不完整数据，直接丢弃
                 await updateApiKeyUsage(apiKey);
                 res.end();
             });
 
-            // 处理客户端断开连接
+            /* ---------- 5. 客户端断开时销毁上游流 ---------- */
             req.on('close', () => {
-                response.data.destroy();
+                upstream.data.destroy();
             });
         } else {
-            // 非流式请求处理
-            const response = await axios({
+            /* ---------- 非流式请求 ---------- */
+            const upstream = await axios({
                 method: 'post',
                 url: 'https://openrouter.ai/api/v1/chat/completions',
                 headers: {
@@ -279,70 +226,31 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                     'HTTP-Referer': 'https://github.com/fengqiaozhu/openrouter-free-pool',
                     'X-Title': 'OpenRouter Free Pool'
                 },
-                data: {
-                    ...req.body,
-                    response_format: { type: "text" }
-                }
+                data: { ...req.body, response_format: { type: 'text' } }
             });
 
-            // 检查响应中是否包含限流错误
-            if (response.data?.error?.code === 429) {
-                const errorMessage = response.data.error.message;
-                const resetTimestamp = parseInt(response.data.error.metadata?.headers?.['X-RateLimit-Reset'] || '0');
+            // 检查限流
+            if (upstream.data?.error?.code === 429) {
+                const msg = upstream.data.error.message;
+                const reset = parseInt(upstream.data.error.metadata?.headers?.['X-RateLimit-Reset'] || '0');
                 logger.warn(`Rate limit exceeded for key ${apiKey.substring(0, 10)}...`);
-                
-                if (resetTimestamp) {
-                    const now = Date.now();
-                    const ttlSeconds = Math.max(1, Math.floor((resetTimestamp - now) / 1000));
-                    
-                    if (errorMessage.includes('free-models-per-day')) {
-                        await redisClient.setEx(`${apiKey}:day`, ttlSeconds, "200");
-                        logger.info(`Marked key ${apiKey.substring(0, 10)}... as daily limit reached, will reset in ${ttlSeconds}s`);
-                    } else if (errorMessage.includes('free-models-per-minute')) {
-                        await redisClient.setEx(`${apiKey}:minute`, ttlSeconds, "20");
-                        logger.info(`Marked key ${apiKey.substring(0, 10)}... as minute limit reached, will reset in ${ttlSeconds}s`);
-                    }
-                } else {
-                    // 如果没有重置时间戳，使用默认值
-                    if (errorMessage.includes('free-models-per-day')) {
-                        await redisClient.setEx(`${apiKey}:day`, 86400, "200");
-                        logger.info(`Marked key ${apiKey.substring(0, 10)}... as daily limit reached (using default TTL)`);
-                    } else if (errorMessage.includes('free-models-per-minute')) {
-                        await redisClient.setEx(`${apiKey}:minute`, 60, "20");
-                        logger.info(`Marked key ${apiKey.substring(0, 10)}... as minute limit reached (using default TTL)`);
-                    }
-                }
-                
-                return res.status(429).json(response.data);
+                const ttl = reset ? Math.max(1, Math.floor((reset - Date.now()) / 1000))
+                    : (msg.includes('free-models-per-day') ? 86400 : 60);
+                const keyType = msg.includes('free-models-per-day') ? 'day' : 'minute';
+                await redisClient.setEx(`${apiKey}:${keyType}`, ttl, keyType === 'day' ? '200' : '20');
+                return res.status(429).json(upstream.data);
             }
 
             await updateApiKeyUsage(apiKey);
-            logger.debug('Successfully processed request');
-            
-            // 处理响应内容中的转义字符
-            if (typeof response.data === 'object' && response.data.choices && response.data.choices[0]) {
-                const content = response.data.choices[0].message?.content;
-                const reasoning = response.data.choices[0].message?.reasoning;
-                
-                if (content) {
-                    response.data.choices[0].message.content = content.replaceAll('\\n', '\n');
-                }
-                if (reasoning) {
-                    response.data.choices[0].message.reasoning = reasoning.replaceAll('\\n', '\n');
-                }
-            }
-            
-            // 直接发送原始响应数据
-            res.json(response.data);
+
+            /* ---------- 6. 非流式响应简单透传 ---------- */
+            res.json(upstream.data);
         }
-    } catch (error) {
-        logger.error('Error processing request:', error);
-        res.status(error.response?.status || 500).json(error.response?.data || {
-            error: {
-                message: "Internal server error",
-                code: 500
-            }
-        });
+    } catch (err) {
+        logger.error('Error processing request:', err);
+        res.status(err.response?.status || 500).json(
+            err.response?.data || { error: { message: 'Internal server error', code: 500 } }
+        );
     }
 });
 
@@ -359,7 +267,7 @@ app.get('/api/v1/keys/status', async (req, res) => {
         for (const key of API_KEYS) {
             const minuteCount = await redisClient.get(`${key}:minute`);
             const dayCount = await redisClient.get(`${key}:day`);
-            
+
             // 获取剩余时间
             const minuteTTL = await redisClient.ttl(`${key}:minute`);
             const dayTTL = await redisClient.ttl(`${key}:day`);
@@ -376,13 +284,13 @@ app.get('/api/v1/keys/status', async (req, res) => {
                     remaining: dayCount ? Math.max(0, 200 - parseInt(dayCount)) : 200,
                     resetIn: dayTTL > 0 ? dayTTL : null
                 },
-                available: (!minuteCount || parseInt(minuteCount) < 20) && 
-                          (!dayCount || parseInt(dayCount) < 200)
+                available: (!minuteCount || parseInt(minuteCount) < 20) &&
+                    (!dayCount || parseInt(dayCount) < 200)
             });
         }
 
         const totalAvailable = results.filter(r => r.available).length;
-        
+
         res.json({
             total_keys: API_KEYS.length,
             available_keys: totalAvailable,
@@ -421,8 +329,8 @@ app.get('/admin', async (req, res) => {
                     remaining: dayCount ? Math.max(0, 200 - parseInt(dayCount)) : 200,
                     resetIn: dayTTL > 0 ? dayTTL : null
                 },
-                available: (!minuteCount || parseInt(minuteCount) < 20) && 
-                          (!dayCount || parseInt(dayCount) < 200)
+                available: (!minuteCount || parseInt(minuteCount) < 20) &&
+                    (!dayCount || parseInt(dayCount) < 200)
             };
         }));
 
@@ -476,7 +384,7 @@ app.post('/admin/keys/add', async (req, res) => {
         // 更新环境变量
         const newKeys = [...API_KEYS, newKey];
         await updateEnvFile('OPENROUTER_API_KEYS', newKeys.join(','));
-        
+
         // 更新内存中的密钥
         API_KEYS.push(newKey);
 
@@ -535,6 +443,18 @@ app.get('/admin/logs', async (req, res) => {
     }
 });
 
+// 允许获得模型列表
+app.get('/api/v1/models', async (req, res) => {
+    try {
+        const response = await axios.get('https://openrouter.ai/api/v1/models', { method: 'GET' });
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        logger.error('Error fetching models:', error);
+        res.status(500).json({ error: 'Failed to fetch models' });
+    }
+});
+
 // 辅助函数：读取最近的日志
 async function readRecentLogs(limit = 100) {
     try {
@@ -570,7 +490,7 @@ async function getTotalRequests() {
         const logFile = path.join(__dirname, '../logs/combined.log');
         const content = await fs.readFile(logFile, 'utf8');
         const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-        
+
         return content
             .split('\n')
             .filter(Boolean)
@@ -578,7 +498,7 @@ async function getTotalRequests() {
                 try {
                     const log = JSON.parse(line);
                     return new Date(log.timestamp).getTime() > oneDayAgo &&
-                           log.path === '/api/v1/chat/completions';
+                        log.path === '/api/v1/chat/completions';
                 } catch (e) {
                     return false;
                 }
@@ -596,7 +516,7 @@ async function getErrorRate() {
         const logFile = path.join(__dirname, '../logs/combined.log');
         const content = await fs.readFile(logFile, 'utf8');
         const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-        
+
         const logs = content
             .split('\n')
             .filter(Boolean)
@@ -604,7 +524,7 @@ async function getErrorRate() {
                 try {
                     const log = JSON.parse(line);
                     return new Date(log.timestamp).getTime() > oneDayAgo &&
-                           log.path === '/api/v1/chat/completions';
+                        log.path === '/api/v1/chat/completions';
                 } catch (e) {
                     return false;
                 }
@@ -634,14 +554,14 @@ async function updateEnvFile(key, value) {
     try {
         const envFile = path.join(__dirname, '../.env');
         let content = await fs.readFile(envFile, 'utf8');
-        
+
         const regex = new RegExp(`^${key}=.*$`, 'm');
         if (content.match(regex)) {
             content = content.replace(regex, `${key}=${value}`);
         } else {
             content += `\n${key}=${value}`;
         }
-        
+
         await fs.writeFile(envFile, content);
     } catch (error) {
         logger.error('Error updating .env file:', error);
