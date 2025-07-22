@@ -51,7 +51,7 @@ app.use(cors({
 }));
 
 // 中间件
-app.use(express.json());
+app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // 请求日志中间件
@@ -447,8 +447,7 @@ app.get('/admin/logs', async (req, res) => {
 app.get('/api/v1/models', async (req, res) => {
     try {
         const response = await axios.get('https://openrouter.ai/api/v1/models', { method: 'GET' });
-        const data = await response.json();
-        res.json(data);
+        res.json(response.data);
     } catch (error) {
         logger.error('Error fetching models:', error);
         res.status(500).json({ error: 'Failed to fetch models' });
